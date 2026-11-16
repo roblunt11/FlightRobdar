@@ -1,0 +1,8 @@
+{
+  "home_lat": 40.7128,
+  "home_lon": -74.0060,
+  "radius_km": 25,
+  "max_shown": 5,
+  "overhead_km": 3,
+  "api_poll_seconds": null
+}
