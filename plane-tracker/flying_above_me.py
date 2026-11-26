@@ -15,15 +15,18 @@ live every second and snap to the true position on each new fetch.
 
 Setup:
     pip install -r requirements.txt
-    Copy config.example.json to config.json and set your latitude/longitude,
-    then run:  python flying_above_me.py
+    python flying_above_me.py
+    (first run asks for your postcode or town and creates config.json for you)
 
 Optional: set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET environment variables
 (free OpenSky account -> API client) for a 10x higher daily quota.
 """
 
+import json
 import math
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -31,16 +34,22 @@ from datetime import datetime
 
 import requests
 
-# ---------------- CONFIG ----------------
-# Settings live in config.json next to this script (copy config.example.json).
-# config.json is git-ignored so your home location never gets committed.
-import json
+from location_setup import ensure_config
 
+# First run: ask for a postcode/town and write config.json if it doesn't exist.
+if not ensure_config():
+    raise SystemExit(1)
+
+# ---------------- CONFIG ----------------
+# Settings live in config.json next to this script (created on first run, or
+# copy config.example.json). config.json is git-ignored so your home location
+# never gets committed.
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-_cfg = {}
-if os.path.exists(_cfg_path):
+try:
     with open(_cfg_path, encoding="utf-8") as _f:
         _cfg = json.load(_f)
+except (OSError, ValueError) as _e:
+    raise SystemExit(f"Could not read config.json ({_e}). Fix or delete it and run again.")
 
 HOME_LAT = _cfg.get("home_lat", 40.7128)        # your latitude
 HOME_LON = _cfg.get("home_lon", -74.0060)       # your longitude
@@ -50,18 +59,22 @@ OVERHEAD_KM = _cfg.get("overhead_km", 3)        # "overhead" alert distance
 
 SCREEN_REFRESH_SECONDS = 1                      # how often the screen redraws
 API_POLL_SECONDS = _cfg.get("api_poll_seconds") # None = automatic (25 s with an OpenSky login, 60 s without)
-MAX_PROJECT_SECONDS = 90                        # stop projecting a plane after this long without new data
+LOOKUP_COUNT = 3                                # look up route/aircraft for this many nearest planes
 # ----------------------------------------
 
 API_URL = "https://opensky-network.org/api/states/all"
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 ADSBDB_ROUTE_URL = "https://api.adsbdb.com/v0/callsign/{}"
 ADSBDB_AIRCRAFT_URL = "https://api.adsbdb.com/v0/aircraft/{}"
+USER_AGENT = "FlightRobdar/1.0 (https://github.com/roblunt11/FlightRobdar)"
 
 CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET")
 HAS_LOGIN = bool(CLIENT_ID and CLIENT_SECRET)
 POLL_SECONDS = API_POLL_SECONDS or (25 if HAS_LOGIN else 60)
+# Keep projecting a plane for longer than one poll interval, otherwise planes
+# vanish between updates when polling slowly (e.g. api_poll_seconds = 220).
+MAX_PROJECT_SECONDS = max(90, POLL_SECONDS + 30)
 
 # Airport-board look: black background, bright yellow text, ALL CAPS.
 BG_BLACK = "\033[40m"
@@ -83,11 +96,21 @@ _route_cache = {}
 _aircraft_cache = {}
 _token = {"value": None, "expires": 0}
 
+_CALLSIGN_OK = re.compile(r"^[A-Z0-9]{2,8}$")
+_ICAO24_OK = re.compile(r"^[0-9a-f]{6}$")
+
 
 class RateLimited(Exception):
     def __init__(self, retry_after):
         super().__init__(f"Rate limited by OpenSky (retry in {retry_after}s)")
         self.retry_after = retry_after
+
+
+def clean(value):
+    """Strip control characters from third-party text before it reaches the terminal."""
+    if value is None:
+        return None
+    return "".join(ch for ch in str(value) if ch.isprintable())
 
 
 # ---------- geometry ----------
@@ -160,7 +183,7 @@ def get_token():
 def fetch_aircraft():
     lamin, lamax, lomin, lomax = bounding_box(HOME_LAT, HOME_LON, RADIUS_KM)
     params = {"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax}
-    headers = {}
+    headers = {"User-Agent": USER_AGENT}
     token = get_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -187,9 +210,9 @@ def fetch_aircraft():
         age = max(0, server_time - pos_time)  # how old the position already was
         planes.append(
             {
-                "icao24": s[0],
-                "callsign": (s[1] or "").strip() or "(unknown)",
-                "country": s[2],
+                "icao24": (clean(s[0]) or "").lower(),
+                "callsign": (clean(s[1]) or "").strip().upper() or "(unknown)",
+                "country": clean(s[2]),
                 "lat": lat,
                 "lon": lon,
                 "alt_ft": alt_m * 3.281 if alt_m is not None else None,
@@ -207,79 +230,103 @@ def fetch_aircraft():
 
 def lookup_route(callsign):
     """Fetch and cache {'airline', 'origin', 'destination'} from adsbdb."""
-    if not callsign or callsign == "(unknown)" or callsign in _route_cache:
+    if callsign in _route_cache or not _CALLSIGN_OK.match(callsign or ""):
         return
     result = None
     try:
-        r = requests.get(ADSBDB_ROUTE_URL.format(callsign), timeout=8)
+        r = requests.get(ADSBDB_ROUTE_URL.format(callsign),
+                         headers={"User-Agent": USER_AGENT}, timeout=8)
         if r.status_code == 200:
             route = r.json().get("response")
             route = route.get("flightroute") if isinstance(route, dict) else None
             if route:
                 def place(p):
-                    if not p:
+                    if not isinstance(p, dict):
                         return None
                     code = p.get("iata_code") or p.get("icao_code") or ""
                     city = p.get("municipality") or p.get("name") or ""
-                    return f"{city} ({code})" if code else city
+                    return clean(f"{city} ({code})" if code else city)
 
+                airline = route.get("airline")
                 result = {
-                    "airline": (route.get("airline") or {}).get("name"),
+                    "airline": clean(airline.get("name")) if isinstance(airline, dict) else None,
                     "origin": place(route.get("origin")),
                     "destination": place(route.get("destination")),
                 }
+        elif r.status_code != 404:
+            return  # rate limit / server error: don't cache, retry on the next poll
     except requests.RequestException:
         return  # not cached; retried on the next poll
-    _route_cache[callsign] = result
+    _route_cache[callsign] = result  # None = adsbdb doesn't know this flight
 
 
 def lookup_aircraft(icao24):
     """Fetch and cache {'type', 'registration', 'owner'} from adsbdb."""
-    if icao24 in _aircraft_cache:
+    if icao24 in _aircraft_cache or not _ICAO24_OK.match(icao24 or ""):
         return
     result = None
     try:
-        r = requests.get(ADSBDB_AIRCRAFT_URL.format(icao24), timeout=8)
+        r = requests.get(ADSBDB_AIRCRAFT_URL.format(icao24),
+                         headers={"User-Agent": USER_AGENT}, timeout=8)
         if r.status_code == 200:
             ac = r.json().get("response")
             ac = ac.get("aircraft") if isinstance(ac, dict) else None
             if ac:
                 kind = " ".join(x for x in (ac.get("manufacturer"), ac.get("type")) if x)
                 result = {
-                    "type": kind or None,
-                    "registration": ac.get("registration"),
-                    "owner": ac.get("registered_owner"),
+                    "type": clean(kind) or None,
+                    "registration": clean(ac.get("registration")),
+                    "owner": clean(ac.get("registered_owner")),
                 }
+        elif r.status_code != 404:
+            return
     except requests.RequestException:
         return
     _aircraft_cache[icao24] = result
 
 
+def _safely(fn, *args):
+    """Run a lookup; an odd adsbdb response must never stop the poller."""
+    try:
+        fn(*args)
+    except Exception:
+        pass
+
+
 # ---------- background poller ----------
 
+def poll_once():
+    """One poll cycle. Returns the time the next poll is due."""
+    started = time.time()
+    wait = POLL_SECONDS
+    planes = None
+    try:
+        planes = fetch_aircraft()
+    except RateLimited as e:
+        wait = max(wait, e.retry_after)
+        err = str(e)
+    except Exception as e:  # keep running through network/API hiccups
+        err = f"Update failed: {e}"
+    next_poll = started + wait
+    with _lock:
+        if planes is not None:
+            _state.update(planes=planes, fetched=time.time(), error=None)
+        else:
+            _state["error"] = err
+        _state["next_poll"] = next_poll  # set before the slower lookups below
+
+    if planes:
+        nearest = sorted(planes, key=lambda p: haversine_km(HOME_LAT, HOME_LON, p["lat"], p["lon"]))
+        for p in nearest[:LOOKUP_COUNT]:
+            _safely(lookup_route, p["callsign"])
+            _safely(lookup_aircraft, p["icao24"])
+    return next_poll
+
+
 def poller():
-    """Runs forever in a thread: fetch planes, then look up details for the closest."""
+    """Runs forever in a thread."""
     while True:
-        started = time.time()
-        wait = POLL_SECONDS
-        try:
-            planes = fetch_aircraft()
-            with _lock:
-                _state.update(planes=planes, fetched=time.time(), error=None)
-            planes.sort(key=lambda p: haversine_km(HOME_LAT, HOME_LON, p["lat"], p["lon"]))
-            for p in planes[:MAX_SHOWN]:
-                lookup_route(p["callsign"])
-                lookup_aircraft(p["icao24"])
-        except RateLimited as e:
-            wait = max(wait, e.retry_after)
-            with _lock:
-                _state["error"] = str(e)
-        except Exception as e:  # keep running through network/API hiccups
-            with _lock:
-                _state["error"] = f"Update failed: {e}"
-        next_poll = started + wait
-        with _lock:
-            _state["next_poll"] = next_poll
+        next_poll = poll_once()
         time.sleep(max(1, next_poll - time.time()))
 
 
@@ -331,19 +378,20 @@ def climb_label(vrate):
 def render(planes, error, fetched, next_poll):
     """Build one screen frame. Returns (frame_text, ids_of_planes_overhead)."""
     lines = []
+    width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
 
     def add(s=""):
-        lines.append(s.upper())  # boards shout in capitals
+        lines.append(s.upper()[:width])  # boards shout in capitals; never wrap
 
     now = time.time()
-    add("=" * 52)
+    add("=" * min(52, width))
     add("  FLYING ABOVE ME")
     add(f"  {datetime.now():%H:%M:%S}  |  radius {RADIUS_KM} km")
     if fetched is None:
         add("  Waiting for first data...")
     else:
         add(f"  Data {now - fetched:.0f}s old  |  next update in {max(0, next_poll - now):.0f}s")
-    add("=" * 52)
+    add("=" * min(52, width))
 
     if error:
         add()
@@ -353,7 +401,10 @@ def render(planes, error, fetched, next_poll):
     if not planes:
         if fetched is not None:
             add()
-            add("  Clear skies. No aircraft in range.")
+            if error or now - fetched > MAX_PROJECT_SECONDS + 5:
+                add("  No live data right now.")  # don't claim clear skies when we simply can't see
+            else:
+                add("  Clear skies. No aircraft in range.")
     else:
         nearest = planes[0]
         add()
